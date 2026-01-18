@@ -1,8 +1,9 @@
 import sys
 import json
 import heapq
-from dataclasses import asdict, dataclass
-from typing import Optional, List, Dict
+import itertools
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
 
 from PySide6.QtWidgets import (QApplication, QGraphicsView, QGraphicsScene,
                                QGraphicsItem, QGraphicsEllipseItem,
@@ -19,15 +20,15 @@ from PySide6.QtGui import QPen, QBrush, QColor, QPainter, QPainterPathStroker, Q
 # 1. Configuration (Конфигурация)
 # ==========================================
 class GraphConfig:
-    NODE_DIAMETER = 20
+    NODE_DIAMETER = 30  # Чуть увеличил для наглядности
     NODE_RADIUS = NODE_DIAMETER / 2
     EDGE_WIDTH = 2
-    MIN_DISTANCE = 40
+    MIN_DISTANCE = 50
 
     COLOR_BG = QColor(40, 40, 40)
-    COLOR_NODE = QColor(0, 255, 255)
+    COLOR_NODE = QColor(0, 200, 255)
     COLOR_NODE_ACTIVE = QColor(255, 0, 255)
-    COLOR_EDGE = QColor(255, 255, 255)
+    COLOR_EDGE = QColor(200, 200, 200)
     COLOR_TEXT = QColor(255, 255, 255)
 
     TABLE_BG = QColor(50, 50, 50)
@@ -76,8 +77,15 @@ class NodeItem(QGraphicsEllipseItem):
     def _create_label(self, text: str):
         self.label = QGraphicsTextItem(text, self)
         self.label.setDefaultTextColor(GraphConfig.COLOR_TEXT)
+        # Центрируем текст относительно круга
+        font = self.label.font()
+        font.setBold(True)
+        font.setPointSize(10)
+        self.label.setFont(font)
+        
+        # Примерное позиционирование метки
         dx = -10 if len(text) == 1 else -15
-        self.label.setPos(dx, -30)
+        self.label.setPos(dx, -35)
         self.label.setFlag(QGraphicsItem.ItemIsMovable)
         self.label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
 
@@ -121,8 +129,8 @@ class ChainBuilder:
 
 
 class GraphManager(QObject):
-    # Сигнал со списком имён узлов (для таблицы)
-    node_list_changed = Signal(list)
+    # Сигнал передает количество узлов, а не их имена
+    node_count_changed = Signal(int)
 
     def __init__(self, scene: QGraphicsScene):
         super().__init__()
@@ -133,11 +141,33 @@ class GraphManager(QObject):
         """Возвращает отсортированный список имён всех узлов"""
         nodes = [item for item in self.scene.items() if isinstance(item, NodeItem)]
         return sorted([n.name for n in nodes])
+    
+    def get_adjacency_dict(self) -> Dict[str, List[str]]:
+        """Возвращает структуру связей графа: { 'A': ['B', 'C'], ... }"""
+        adj = {}
+        nodes = [item for item in self.scene.items() if isinstance(item, NodeItem)]
+        
+        # Инициализируем списки
+        for n in nodes:
+            adj[n.name] = []
+            
+        visited_edges = set()
+        for n in nodes:
+            for edge in n.edges:
+                if edge in visited_edges:
+                    continue
+                visited_edges.add(edge)
+                u_name = edge.source.name
+                v_name = edge.dest.name
+                if u_name in adj: adj[u_name].append(v_name)
+                if v_name in adj: adj[v_name].append(u_name)
+        
+        return adj
 
     def reset(self):
         self.node_counter = 0
         self.scene.clear()
-        self.node_list_changed.emit([])
+        self.node_count_changed.emit(0)
 
     def generate_name(self) -> str:
         n = self.node_counter
@@ -152,11 +182,13 @@ class GraphManager(QObject):
         if name is None:
             name = self.generate_name()
         else:
-            self.node_counter += 1
+            # Если загружаем из файла, пытаемся обновить счетчик, чтобы не было дублей
+            # Это упрощенная логика
+            pass 
 
         node = NodeItem(name, pos.x(), pos.y())
         self.scene.addItem(node)
-        self.node_list_changed.emit(self.get_sorted_node_names())
+        self.node_count_changed.emit(self.get_node_count())
         return node
 
     def create_edge(self, u: NodeItem, v: NodeItem):
@@ -175,7 +207,7 @@ class GraphManager(QObject):
             for edge in list(item.edges):
                 self.delete_item(edge)
             self.scene.removeItem(item)
-            self.node_list_changed.emit(self.get_sorted_node_names())
+            self.node_count_changed.emit(self.get_node_count())
         elif isinstance(item, EdgeItem):
             item.source.remove_connection(item)
             item.dest.remove_connection(item)
@@ -206,19 +238,20 @@ class WeightMatrixWidget(QTableWidget):
         self.setColumnCount(0)
         self.setRowCount(0)
         self.setWindowTitle("Матрица весов")
-        self.node_names: List[str] = []
-
+        
         self.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {GraphConfig.TABLE_BG.name()};
                 color: {GraphConfig.TABLE_TEXT.name()};
                 gridline-color: #666;
+                font-size: 12px;
             }}
             QHeaderView::section {{
                 background-color: #333;
                 color: white;
                 padding: 4px;
                 border: 1px solid #666;
+                font-weight: bold;
             }}
             QLineEdit {{ color: white; background-color: #444; }}
         """)
@@ -228,17 +261,15 @@ class WeightMatrixWidget(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
 
-    def update_from_nodes(self, node_names: List[str]):
-        """Обновляет таблицу на основе списка имён узлов"""
-        self.node_names = node_names
-        node_count = len(node_names)
-
+    def update_size(self, node_count: int):
+        """Обновляет размер таблицы. Заголовки теперь ЦИФРОВЫЕ."""
         self.setRowCount(node_count)
         self.setColumnCount(node_count)
 
-        # Буквенные заголовки (имена вершин)
-        self.setHorizontalHeaderLabels(node_names)
-        self.setVerticalHeaderLabels(node_names)
+        # ЦИФРОВЫЕ заголовки (1, 2, 3...)
+        labels = [str(i + 1) for i in range(node_count)]
+        self.setHorizontalHeaderLabels(labels)
+        self.setVerticalHeaderLabels(labels)
 
         self.blockSignals(True)
 
@@ -275,7 +306,24 @@ class WeightMatrixWidget(QTableWidget):
             symmetric_item.setText(text)
         self.blockSignals(False)
 
-    def get_data(self) -> List[List[str]]:
+    def get_matrix_data(self) -> List[List[int]]:
+        """Возвращает матрицу весов (int). 0 если пути нет."""
+        rows = self.rowCount()
+        data = [[0] * rows for _ in range(rows)]
+        for r in range(rows):
+            for c in range(rows):
+                if r == c: continue
+                item = self.item(r, c)
+                if item and item.text().strip():
+                    try:
+                        val = int(item.text())
+                        data[r][c] = val
+                    except ValueError:
+                        pass
+        return data
+
+    def get_data_strings(self) -> List[List[str]]:
+        """Для сохранения в JSON"""
         rows = self.rowCount()
         data = []
         for r in range(rows):
@@ -286,20 +334,9 @@ class WeightMatrixWidget(QTableWidget):
             data.append(row_data)
         return data
 
-    def set_data(self, data: List[List[str]], node_names: List[str] = None):
+    def set_data_strings(self, data: List[List[str]]):
         size = len(data)
-        if node_names is None:
-            # Генерируем имена по умолчанию
-            node_names = []
-            for i in range(size):
-                n = i
-                name = ""
-                while n >= 0:
-                    name = chr(ord('A') + (n % 26)) + name
-                    n = n // 26 - 1
-                node_names.append(name)
-
-        self.update_from_nodes(node_names)
+        self.update_size(size)
         self.blockSignals(True)
         for r in range(size):
             for c in range(size):
@@ -365,8 +402,8 @@ class GraphScene(QGraphicsScene):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Тренажер: Граф и Матрица весов (ЕГЭ Информатика)")
-        self.resize(1200, 700)
+        self.setWindowTitle("ЕГЭ Информатика: Задание 1 (Граф + Матрица)")
+        self.resize(1200, 750)
 
         # 1. Сцена и Менеджер
         self.scene = QGraphicsScene()
@@ -381,7 +418,8 @@ class MainWindow(QMainWindow):
         self.matrix_widget = WeightMatrixWidget()
 
         # 3. Связь Граф -> Таблица
-        self.graph_manager.node_list_changed.connect(self.matrix_widget.update_from_nodes)
+        # Теперь передаем только количество вершин, названия в таблице будут цифрами
+        self.graph_manager.node_count_changed.connect(self.matrix_widget.update_size)
 
         # 4. Лейаут
         central_widget = QWidget()
@@ -389,13 +427,20 @@ class MainWindow(QMainWindow):
 
         # Левая часть (Матрица + Солвер)
         left_layout = QVBoxLayout()
-        left_label = QLabel("Матрица весов (Симметричная)")
+        left_label = QLabel("Матрица весов (Вершины 1, 2, 3...)")
+        left_label.setStyleSheet("font-weight: bold; color: #aaa;")
         left_layout.addWidget(left_label)
         left_layout.addWidget(self.matrix_widget)
 
         # ====== СОЛВЕР ======
-        solver_group = QGroupBox("🔍 Солвер: Поиск кратчайшего пути")
+        solver_group = QGroupBox("🔍 Поиск решения (Сопоставление)")
+        solver_group.setStyleSheet("QGroupBox { border: 1px solid #666; margin-top: 10px; padding-top: 15px; font-weight: bold;}")
         solver_layout = QVBoxLayout()
+
+        # Пояснение
+        help_label = QLabel("Программа автоматически сопоставит граф (буквы) и матрицу (цифры)\nи найдет расстояние.")
+        help_label.setStyleSheet("color: #aaa; font-size: 10px; font-style: italic;")
+        solver_layout.addWidget(help_label)
 
         # Поля ввода
         input_layout = QHBoxLayout()
@@ -404,31 +449,38 @@ class MainWindow(QMainWindow):
         self.vertex1_input.setPlaceholderText("A")
         self.vertex1_input.setMaximumWidth(50)
         self.vertex1_input.setAlignment(Qt.AlignCenter)
+        self.vertex1_input.setStyleSheet("font-size: 14px; font-weight: bold;")
 
         self.vertex2_input = QLineEdit()
-        self.vertex2_input.setPlaceholderText("B")
+        self.vertex2_input.setPlaceholderText("G")
         self.vertex2_input.setMaximumWidth(50)
         self.vertex2_input.setAlignment(Qt.AlignCenter)
+        self.vertex2_input.setStyleSheet("font-size: 14px; font-weight: bold;")
 
         self.solve_button = QPushButton("Найти расстояние")
+        self.solve_button.setStyleSheet("background-color: #2a82da; color: white; font-weight: bold; padding: 5px;")
         self.solve_button.clicked.connect(self.find_shortest_path)
 
-        input_layout.addWidget(QLabel("От вершины:"))
+        input_layout.addWidget(QLabel("От (буква):"))
         input_layout.addWidget(self.vertex1_input)
-        input_layout.addWidget(QLabel("до вершины:"))
+        input_layout.addWidget(QLabel("До (буква):"))
         input_layout.addWidget(self.vertex2_input)
         input_layout.addWidget(self.solve_button)
         input_layout.addStretch()
 
         # Результат
-        self.result_label = QLabel("Результат: —")
-        self.result_label.setStyleSheet("font-size: 14px; font-weight: bold; padding: 5px;")
+        self.mapping_label = QLabel("Сопоставление: —")
+        self.mapping_label.setStyleSheet("font-size: 11px; color: yellow; padding: 2px;")
+        self.mapping_label.setWordWrap(True)
 
-        # Путь
+        self.result_label = QLabel("Результат: —")
+        self.result_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 5px; color: #00ff00;")
+
         self.path_label = QLabel("Путь: —")
         self.path_label.setStyleSheet("font-size: 12px; padding: 5px;")
 
         solver_layout.addLayout(input_layout)
+        solver_layout.addWidget(self.mapping_label)
         solver_layout.addWidget(self.result_label)
         solver_layout.addWidget(self.path_label)
         solver_group.setLayout(solver_layout)
@@ -438,8 +490,13 @@ class MainWindow(QMainWindow):
 
         # Правая часть (Граф)
         right_layout = QVBoxLayout()
-        right_label = QLabel("Редактор графа (ЛКМ - узел, Shift+ЛКМ - ребро, ПКМ - удалить)")
+        right_label = QLabel("Граф (Вершины A, B, C...)")
+        right_label.setStyleSheet("font-weight: bold; color: #aaa;")
+        right_sublabel = QLabel("ЛКМ - узел, Shift+ЛКМ - ребро, ПКМ - удалить")
+        right_sublabel.setStyleSheet("color: #777; font-size: 10px;")
+        
         right_layout.addWidget(right_label)
+        right_layout.addWidget(right_sublabel)
         right_layout.addWidget(self.view)
 
         main_layout.addLayout(left_layout, 1)
@@ -451,86 +508,163 @@ class MainWindow(QMainWindow):
         self.create_menu()
 
     def find_shortest_path(self):
-        """Алгоритм Дейкстры для поиска кратчайшего пути"""
+        """
+        Основная логика решения задания 1 ЕГЭ:
+        1. Найти изоморфизм между графом (Буквы) и Матрицей (Индексы).
+        2. Перевести запрос пользователя (Буквы) в индексы матрицы.
+        3. Запустить Дейкстру.
+        """
         v1_name = self.vertex1_input.text().strip().upper()
         v2_name = self.vertex2_input.text().strip().upper()
 
+        # 1. Сброс UI
+        self.mapping_label.setText("Сопоставление: Идет поиск...")
+        self.result_label.setText("Результат: —")
+        self.path_label.setText("Путь: —")
+        QApplication.processEvents()
+
+        # 2. Получение данных
+        # Словарь смежности графа: {'A': ['B', 'C'], 'B': ['A'], ...}
+        graph_adj = self.graph_manager.get_adjacency_dict()
+        node_names = sorted(graph_adj.keys())
+        
+        # Матрица смежности (веса): [[0, 15, 0], [15, 0, 5]...]
+        matrix = self.matrix_widget.get_matrix_data()
+        matrix_size = len(matrix)
+
+        # 3. Валидация
         if not v1_name or not v2_name:
             self.result_label.setText("⚠️ Введите обе вершины!")
-            self.path_label.setText("Путь: —")
+            self.mapping_label.setText("")
             return
 
-        # Получаем список имён узлов
-        node_names = self.graph_manager.get_sorted_node_names()
-
-        if not node_names:
+        if len(node_names) != matrix_size:
+            self.result_label.setText("⚠️ Ошибка размеров!")
+            self.mapping_label.setText(f"В графе {len(node_names)} вершин, в матрице {matrix_size}.")
+            return
+        
+        if len(node_names) == 0:
             self.result_label.setText("⚠️ Граф пуст!")
+            self.mapping_label.setText("")
+            return
+
+        if v1_name not in node_names or v2_name not in node_names:
+            self.result_label.setText("⚠️ Нет таких вершин в графе!")
+            self.mapping_label.setText("")
+            return
+
+        # 4. ПОИСК ИЗОМОРФИЗМА (Сопоставление Букв и Цифр)
+        # Мы перебираем все перестановки индексов [0, 1, ... N-1]
+        # и пытаемся назначить их буквам ['A', 'B', ...].
+        
+        indices = list(range(matrix_size))
+        mapping = None # Будет хранить dict {'A': 0, 'B': 2, ...}
+        
+        # Перебор перестановок. Для N <= 8 это быстро (8! = 40320)
+        # Для ЕГЭ обычно N <= 7.
+        for perm in itertools.permutations(indices):
+            # Создаем гипотетическое отображение: node_names[i] -> perm[i]
+            temp_map = {name: idx for name, idx in zip(node_names, perm)}
+            
+            is_valid = True
+            
+            # Проверка 1: Степени вершин (кол-во ребер) должны совпадать
+            # Это быстрая отсечка
+            for name, idx in temp_map.items():
+                graph_degree = len(graph_adj[name])
+                matrix_degree = sum(1 for x in matrix[idx] if x > 0)
+                if graph_degree != matrix_degree:
+                    is_valid = False
+                    break
+            
+            if not is_valid:
+                continue
+
+            # Проверка 2: Топология (ребро в графе <=> ребро в матрице)
+            for name_u in node_names:
+                idx_u = temp_map[name_u]
+                
+                # Проверяем соседей в графе
+                graph_neighbors = set(graph_adj[name_u])
+                
+                # Проверяем соседей в матрице (тех, у кого вес > 0)
+                # Нам нужно найти имена, которые соответствуют индексам матрицы
+                # Для этого нужно обратное отображение
+                reverse_map = {v: k for k, v in temp_map.items()}
+                
+                matrix_neighbors_indices = [col for col, w in enumerate(matrix[idx_u]) if w > 0]
+                matrix_neighbors_names = set(reverse_map[i] for i in matrix_neighbors_indices)
+                
+                if graph_neighbors != matrix_neighbors_names:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                mapping = temp_map
+                break
+        
+        if mapping is None:
+            self.result_label.setText("⚠️ Несовпадение топологии!")
+            self.mapping_label.setText("Невозможно сопоставить граф и матрицу. Проверьте связи.")
+            return
+
+        # 5. Отображение найденного соответствия
+        mapping_str = ", ".join([f"{k}→{v+1}" for k, v in sorted(mapping.items())])
+        self.mapping_label.setText(f"Найдено: {mapping_str}")
+
+        # 6. Запуск алгоритма Дейкстры по матрице
+        start_idx = mapping[v1_name]
+        end_idx = mapping[v2_name]
+        
+        dist, prev = self.dijkstra(matrix, start_idx)
+        
+        result_dist = dist[end_idx]
+        
+        if result_dist == float('inf'):
+            self.result_label.setText(f"❌ Пути нет")
             self.path_label.setText("Путь: —")
-            return
+        else:
+            # Восстановление пути (по индексам)
+            path_indices = []
+            curr = end_idx
+            while curr != -1:
+                path_indices.append(curr)
+                curr = prev[curr]
+            path_indices.reverse()
+            
+            # Перевод индексов обратно в буквы для отображения
+            # Нам нужно найти ключ по значению
+            idx_to_name = {v: k for k, v in mapping.items()}
+            path_names = [idx_to_name[i] for i in path_indices]
+            
+            self.result_label.setText(f"✅ Расстояние: {result_dist}")
+            self.path_label.setText(f"Путь: {' → '.join(path_names)}")
 
-        if v1_name not in node_names:
-            self.result_label.setText(f"⚠️ Вершина '{v1_name}' не найдена!")
-            self.path_label.setText("Путь: —")
-            return
-
-        if v2_name not in node_names:
-            self.result_label.setText(f"⚠️ Вершина '{v2_name}' не найдена!")
-            self.path_label.setText("Путь: —")
-            return
-
-        if v1_name == v2_name:
-            self.result_label.setText(f"✅ Расстояние от {v1_name} до {v2_name}: 0")
-            self.path_label.setText(f"Путь: {v1_name}")
-            return
-
-        # Маппинг имя -> индекс
-        name_to_idx = {name: i for i, name in enumerate(node_names)}
-        idx_to_name = {i: name for i, name in enumerate(node_names)}
-
-        start = name_to_idx[v1_name]
-        end = name_to_idx[v2_name]
-
-        # Матрица весов
-        matrix = self.matrix_widget.get_data()
+    def dijkstra(self, matrix, start_node):
         n = len(matrix)
-
-        # Алгоритм Дейкстры
-        INF = float('inf')
-        dist = [INF] * n
-        prev = [-1] * n  # Для восстановления пути
-        dist[start] = 0
-        pq = [(0, start)]
+        dist = [float('inf')] * n
+        prev = [-1] * n
+        dist[start_node] = 0
+        visited = [False] * n
+        
+        # Используем приоритетную очередь
+        pq = [(0, start_node)]
 
         while pq:
             d, u = heapq.heappop(pq)
+            
             if d > dist[u]:
                 continue
+            
             for v in range(n):
-                weight_str = matrix[u][v].strip()
-                if weight_str and u != v:
-                    try:
-                        w = int(weight_str)
-                        if w > 0 and dist[u] + w < dist[v]:
-                            dist[v] = dist[u] + w
-                            prev[v] = u
-                            heapq.heappush(pq, (dist[v], v))
-                    except ValueError:
-                        pass  # Игнорируем некорректные значения
-
-        if dist[end] == INF:
-            self.result_label.setText(f"❌ Пути от {v1_name} до {v2_name} не существует!")
-            self.path_label.setText("Путь: —")
-        else:
-            # Восстанавливаем путь
-            path = []
-            current = end
-            while current != -1:
-                path.append(idx_to_name[current])
-                current = prev[current]
-            path.reverse()
-
-            self.result_label.setText(f"✅ Расстояние от {v1_name} до {v2_name}: {dist[end]}")
-            self.path_label.setText(f"Путь: {' → '.join(path)}")
+                weight = matrix[u][v]
+                if weight > 0: # Если есть ребро
+                    if dist[u] + weight < dist[v]:
+                        dist[v] = dist[u] + weight
+                        prev[v] = u
+                        heapq.heappush(pq, (dist[v], v))
+                        
+        return dist, prev
 
     def create_menu(self):
         menu = self.menuBar()
@@ -550,19 +684,23 @@ class MainWindow(QMainWindow):
 
     def clear_all(self):
         self.graph_manager.reset()
-        self.matrix_widget.update_from_nodes([])
+        # Таблица очистится через сигнал node_count_changed -> 0
         self.result_label.setText("Результат: —")
         self.path_label.setText("Путь: —")
+        self.mapping_label.setText("Сопоставление: —")
 
     def save_exercise(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", "", "JSON Files (*.json)")
         if not file_path:
             return
 
+        # Сохраняем узлы
         nodes_data = []
-        node_id_map = {}
-
+        node_id_map = {} # Object -> Index
         items = [i for i in self.scene.items() if isinstance(i, NodeItem)]
+        # Сортируем по имени для порядка
+        items.sort(key=lambda x: x.name)
+        
         for idx, node in enumerate(items):
             node_id_map[node] = idx
             nodes_data.append({
@@ -572,19 +710,20 @@ class MainWindow(QMainWindow):
                 "y": node.pos().y()
             })
 
+        # Сохраняем ребра
         edges_data = []
         visited_edges = set()
         for node in items:
             for edge in node.edges:
                 if edge not in visited_edges:
                     visited_edges.add(edge)
-                    u_id = node_id_map.get(edge.source)
-                    v_id = node_id_map.get(edge.dest)
-                    if u_id is not None and v_id is not None:
-                        edges_data.append({"u": u_id, "v": v_id})
+                    u_idx = node_id_map.get(edge.source)
+                    v_idx = node_id_map.get(edge.dest)
+                    if u_idx is not None and v_idx is not None:
+                        edges_data.append({"u": u_idx, "v": v_idx})
 
-        matrix_data = self.matrix_widget.get_data()
-        node_names = self.graph_manager.get_sorted_node_names()
+        # Сохраняем матрицу как строки
+        matrix_data = self.matrix_widget.get_data_strings()
 
         data = {
             "graph": {
@@ -592,8 +731,7 @@ class MainWindow(QMainWindow):
                 "edges": edges_data,
                 "node_counter": self.graph_manager.node_counter
             },
-            "matrix": matrix_data,
-            "node_names": node_names
+            "matrix": matrix_data
         }
 
         try:
@@ -620,13 +758,16 @@ class MainWindow(QMainWindow):
 
             self.graph_manager.node_counter = graph_data.get("node_counter", 0)
 
+            # Восстанавливаем узлы по ID
             id_to_node = {}
             for n_data in nodes_list:
                 pos = QPointF(n_data["x"], n_data["y"])
                 name = n_data["name"]
+                # Создаем узел с конкретным именем
                 node = self.graph_manager.create_node(pos, name)
                 id_to_node[n_data["id"]] = node
 
+            # Восстанавливаем ребра
             for e_data in edges_list:
                 u = id_to_node.get(e_data["u"])
                 v = id_to_node.get(e_data["v"])
@@ -634,8 +775,7 @@ class MainWindow(QMainWindow):
                     self.graph_manager.create_edge(u, v)
 
             matrix_data = data.get("matrix", [])
-            node_names = data.get("node_names", self.graph_manager.get_sorted_node_names())
-            self.matrix_widget.set_data(matrix_data, node_names)
+            self.matrix_widget.set_data_strings(matrix_data)
 
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить файл: {e}")
